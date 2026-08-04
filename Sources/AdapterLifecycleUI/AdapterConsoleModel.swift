@@ -25,6 +25,9 @@ public final class AdapterConsoleModel {
 
     private let configuration: AdapterConsoleConfiguration
     private let coordinator: AdapterLifecycleCoordinator
+    /// Real scorer, run on the fixtures at eval time. The console never displays a delta
+    /// that was not computed from the text in `AdapterConsoleConfiguration.evalFixtures`.
+    private let evalRunner = OfflineEvalRunner()
     private var osUpdateStep = 0
     private var nextLogID = 0
     private var pressureCandidateAdmitted = false
@@ -50,6 +53,8 @@ public final class AdapterConsoleModel {
     }
 
     public var tasks: [TaskIdentifier] { configuration.tasks }
+
+    public var exposureStops: [Int] { configuration.exposureStops }
 
     public var canSimulateOSUpdate: Bool { osUpdateStep < configuration.osUpdateLadder.count }
 
@@ -95,7 +100,7 @@ public final class AdapterConsoleModel {
     /// would, and reports what that cost.
     public func simulateOSUpdate() async {
         guard let next = nextBaseModel else { return }
-        osUpdateStep += 1
+        osUpdateStep = Saturating.add(osUpdateStep, 1)
         await run {
             let report = await self.coordinator.baseModelDidChange(to: next)
             self.note("OS update: base model \(report.previous) → \(report.current)")
@@ -191,22 +196,18 @@ public final class AdapterConsoleModel {
         isBusy = false
     }
 
+    /// Runs the golden set through `OfflineEvalRunner` and files the resulting records.
+    ///
+    /// The scores are computed here, not looked up. That is the difference between a demo
+    /// that renders numbers someone typed into a struct and one where the gate is actually
+    /// deciding on measured output.
     private func recordEvals(against base: BaseModelVersion) async {
         var everything = configuration.catalog
         if let candidate = configuration.pressureCandidate { everything.append(candidate) }
         for descriptor in everything {
-            guard let profile = configuration.evalProfiles[descriptor.id] else { continue }
-            await coordinator.recordEval(
-                EvalRecord(
-                    adapter: descriptor.id,
-                    adapterRevision: descriptor.revision,
-                    task: descriptor.task,
-                    evaluatedAgainstBase: base,
-                    adapterScore: profile.adapterScore,
-                    baseScore: profile.baseScore,
-                    sampleCount: profile.sampleCount
-                )
-            )
+            guard let comparisons = configuration.evalFixtures[descriptor.id] else { continue }
+            let record = evalRunner.evaluate(comparisons, adapter: descriptor, against: base)
+            await coordinator.recordEval(record)
         }
     }
 
@@ -228,6 +229,8 @@ public final class AdapterConsoleModel {
                 return "Refused \(name): \(LifecyclePresentation.megabytes(payload)) will not fit in \(LifecyclePresentation.megabytes(available))"
             case let .rejectedIncompatible(window, installed):
                 return "Refused \(name): built for \(window), device is on \(installed)"
+            case let .rejectedTooManyResidents(limit):
+                return "Refused \(name): already holding the maximum of \(limit) adapters"
             case .admitted, .alreadyResident:
                 return "Installed \(name)"
             }
@@ -239,7 +242,10 @@ public final class AdapterConsoleModel {
     }
 
     private func note(_ text: String) {
-        nextLogID += 1
+        // `Saturating.add`, not `+= 1`: the package's stated rule is that no trapping
+        // arithmetic exists anywhere in it, and a counter incremented once per user action
+        // is still an `Int` that a compiler will happily trap on.
+        nextLogID = Saturating.add(nextLogID, 1)
         log.insert(LogLine(id: nextLogID, text: text), at: 0)
         if log.count > Self.logLimit { log.removeLast(log.count - Self.logLimit) }
     }

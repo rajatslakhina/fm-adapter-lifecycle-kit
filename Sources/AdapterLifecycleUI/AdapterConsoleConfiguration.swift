@@ -8,28 +8,20 @@ import AdapterLifecycle
 /// screenshot of one particular app.
 public struct AdapterConsoleConfiguration: Sendable {
 
-    /// The scores an offline eval run would produce for an adapter. Held separately from
-    /// `AdapterDescriptor` because an eval is a measurement taken at a moment against a
-    /// specific base model, not a property of the artifact.
-    public struct EvalProfile: Sendable, Hashable {
-        public let adapterScore: Double
-        public let baseScore: Double
-        public let sampleCount: Int
-
-        public init(adapterScore: Double, baseScore: Double, sampleCount: Int) {
-            self.adapterScore = adapterScore
-            self.baseScore = baseScore
-            self.sampleCount = sampleCount
-        }
-    }
-
     public var installationID: String
     public var initialBaseModel: BaseModelVersion
     /// Successive base model versions the "OS update" control walks through. Empty means
     /// the control is unavailable rather than crashing on an out-of-range index.
     public var osUpdateLadder: [BaseModelVersion]
     public var catalog: [AdapterDescriptor]
-    public var evalProfiles: [AdapterIdentifier: EvalProfile]
+    /// The golden evaluation set per adapter: for each case, the right answer and what
+    /// each of the two candidate models actually produced.
+    ///
+    /// Not a pair of pre-computed scores. `AdapterConsoleModel` runs these through
+    /// `OfflineEvalRunner` and a real `TaskScorer`, so the delta the gate sees is measured
+    /// at run time from the text — which means the console cannot show a number the
+    /// scoring code disagrees with.
+    public var evalFixtures: [AdapterIdentifier: [OfflineEvalRunner.Comparison]]
     /// Tasks offered in the picker, in display order.
     public var tasks: [TaskIdentifier]
     public var storageBudgetBytes: Int
@@ -44,7 +36,7 @@ public struct AdapterConsoleConfiguration: Sendable {
         initialBaseModel: BaseModelVersion,
         osUpdateLadder: [BaseModelVersion],
         catalog: [AdapterDescriptor],
-        evalProfiles: [AdapterIdentifier: EvalProfile],
+        evalFixtures: [AdapterIdentifier: [OfflineEvalRunner.Comparison]],
         tasks: [TaskIdentifier],
         storageBudgetBytes: Int,
         evalGate: EvalGate,
@@ -56,7 +48,7 @@ public struct AdapterConsoleConfiguration: Sendable {
         self.initialBaseModel = initialBaseModel
         self.osUpdateLadder = osUpdateLadder
         self.catalog = catalog
-        self.evalProfiles = evalProfiles
+        self.evalFixtures = evalFixtures
         self.tasks = tasks
         self.storageBudgetBytes = storageBudgetBytes
         self.evalGate = evalGate
@@ -70,5 +62,11 @@ public struct AdapterConsoleConfiguration: Sendable {
     /// console instead of a crash on launch.
     public var primaryTask: TaskIdentifier {
         tasks.first ?? TaskIdentifier("unconfigured")
+    }
+
+    /// Rollout stops offered in the picker. Always includes the configured starting
+    /// exposure, so the segmented control can never open with nothing selected.
+    public var exposureStops: [Int] {
+        Array(Set([0, 5, 25, 50, 100, min(100, max(0, initialExposurePercent))])).sorted()
     }
 }

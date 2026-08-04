@@ -8,13 +8,9 @@ import SwiftUI
 public struct AdapterConsoleView: View {
 
     @State private var model: AdapterConsoleModel
-    @State private var exposure: Int
-
-    private static let exposureStops = [0, 5, 25, 50, 100]
 
     public init(configuration: AdapterConsoleConfiguration) {
         _model = State(initialValue: AdapterConsoleModel(configuration: configuration))
-        _exposure = State(initialValue: configuration.initialExposurePercent)
     }
 
     public var body: some View {
@@ -92,6 +88,13 @@ public struct AdapterConsoleView: View {
         }
     }
 
+    private var exposureBinding: Binding<Int> {
+        Binding(
+            get: { model.snapshot?.exposurePercent ?? model.exposureStops.last ?? 100 },
+            set: { newValue in Task { await model.setExposure(percent: newValue) } }
+        )
+    }
+
     private var taskBinding: Binding<String> {
         Binding(
             get: { model.selectedTask.rawValue },
@@ -125,15 +128,15 @@ public struct AdapterConsoleView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Rollout exposure").font(.subheadline)
-                Picker("Rollout exposure", selection: $exposure) {
-                    ForEach(Self.exposureStops, id: \.self) { stop in
+                // Bound to the coordinator's snapshot, not to a local @State copy. The
+                // console's claim is that it never keeps its own copy of the decision, and
+                // a shadow `exposure` here would have made that claim false.
+                Picker("Rollout exposure", selection: exposureBinding) {
+                    ForEach(model.exposureStops, id: \.self) { stop in
                         Text("\(stop)%").tag(stop)
                     }
                 }
                 .pickerStyle(.segmented)
-            }
-            .onChange(of: exposure) { _, newValue in
-                Task { await model.setExposure(percent: newValue) }
             }
 
             Button(role: .destructive) {
