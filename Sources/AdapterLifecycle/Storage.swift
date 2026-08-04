@@ -13,27 +13,42 @@ public struct AdapterStorage: Sendable {
         /// Logical clock, not wall time. LRU only needs an ordering, and a monotonic
         /// counter is immune to clock changes, timezone shifts and test flakiness.
         public internal(set) var lastAccessTick: UInt64
-        /// Pinned residents are exempt from LRU eviction. Used for the adapter currently
-        /// serving traffic, so a background fetch cannot evict the model in active use.
+        /// Pinned residents are exempt from LRU eviction. Used for the adapters currently
+        /// serving traffic, so a background fetch cannot evict a model in active use.
         public internal(set) var isPinned: Bool
+
+        public init(descriptor: AdapterDescriptor, lastAccessTick: UInt64, isPinned: Bool) {
+            self.descriptor = descriptor
+            self.lastAccessTick = lastAccessTick
+            self.isPinned = isPinned
+        }
     }
 
     public enum AdmissionOutcome: Sendable, Equatable {
         case admitted(evicted: [AdapterIdentifier])
         case alreadyResident
         /// Even after evicting everything evictable, the artifact does not fit.
+        /// `availableBytes` is what was actually free at the moment of refusal — not the
+        /// whole budget — so the message a user or a log reader sees is the true headroom.
         case rejectedExceedsBudget(payloadBytes: Int, availableBytes: Int)
         /// Refused before spending a byte: this artifact cannot run on the installed base
         /// model, so caching it is pure waste.
         case rejectedIncompatible(window: BaseModelWindow, installed: BaseModelVersion)
+        /// The byte budget has room but the resident count is at its ceiling. Bundled and
+        /// zero-byte artifacts consume no bytes, so without this the resident set is
+        /// unbounded even though `usedBytes` never moves.
+        case rejectedTooManyResidents(limit: Int)
     }
 
     public private(set) var budgetBytes: Int
+    /// Hard ceiling on how many artifacts may be resident regardless of their size.
+    public let maximumResidents: Int
     private var residents: [AdapterIdentifier: Resident] = [:]
     private var tick: UInt64 = 0
 
-    public init(budgetBytes: Int) {
+    public init(budgetBytes: Int, maximumResidents: Int = 32) {
         self.budgetBytes = Saturating.nonNegative(budgetBytes)
+        self.maximumResidents = max(1, maximumResidents)
     }
 
     // MARK: - Queries
@@ -90,6 +105,10 @@ public struct AdapterStorage: Sendable {
             return .rejectedIncompatible(window: descriptor.compatibility, installed: installedBase)
         }
 
+        guard residents.count < maximumResidents else {
+            return .rejectedTooManyResidents(limit: maximumResidents)
+        }
+
         guard descriptor.consumesManagedStorage else {
             // Bundled: no budget to check, it is already on the device.
             insert(descriptor)
@@ -97,8 +116,11 @@ public struct AdapterStorage: Sendable {
         }
 
         let payload = descriptor.payloadBytes
+        // Reported against the free space, not the whole budget: "400 MB will not fit in
+        // 60 MB" is actionable, "400 MB will not fit in 220 MB" is confusing when 160 MB
+        // of that 220 is already spoken for.
         guard payload <= budgetBytes else {
-            return .rejectedExceedsBudget(payloadBytes: payload, availableBytes: budgetBytes)
+            return .rejectedExceedsBudget(payloadBytes: payload, availableBytes: availableBytes)
         }
 
         var evicted: [AdapterIdentifier] = []
@@ -132,12 +154,19 @@ public struct AdapterStorage: Sendable {
         residents[id] = resident
     }
 
-    /// Pins exactly one resident and unpins every other, so the serving adapter is the
-    /// only protected one. Passing `nil` unpins everything.
-    public mutating func pinExclusively(_ id: AdapterIdentifier?) {
+    /// Pins exactly the given set and unpins everything else.
+    ///
+    /// Takes a *set*, not a single identifier. An app with more than one task has more than
+    /// one adapter serving at a time, and an earlier version of this took one id — which
+    /// meant resolving task B silently unpinned the adapter still serving task A, and a
+    /// background fetch could then evict a model in active use. That is exactly the
+    /// guarantee this method exists to provide, so the signature has to be able to express
+    /// it. `CoordinatorTests.testResolvingASecondTaskDoesNotUnpinTheFirstTasksAdapter`
+    /// covers the regression.
+    public mutating func setPinned(exactly pinned: Set<AdapterIdentifier>) {
         for key in residents.keys {
             guard var resident = residents[key] else { continue }
-            resident.isPinned = (key == id)
+            resident.isPinned = pinned.contains(key)
             residents[key] = resident
         }
     }

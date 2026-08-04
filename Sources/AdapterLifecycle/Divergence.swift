@@ -1,10 +1,10 @@
 /// A bounded record of how the adapter is doing against the base model *in production*,
 /// after the offline eval gate has already said yes.
 ///
-/// The offline gate proves the adapter was better on a fixed dataset at build time. This
-/// is the other half: the online signal that tells you the OS updated, or the user's data
-/// drifted, and the thing you measured six weeks ago is now losing. It is fixed-capacity
-/// by construction — an unbounded telemetry buffer on a device is a memory leak with a
+/// The offline gate proves the adapter was better on a fixed dataset at build time. This is
+/// the other half: the online signal that tells you the OS updated, or the user's data
+/// drifted, and the thing you measured six weeks ago is now losing. It is fixed-capacity by
+/// construction — an unbounded telemetry buffer on a device is a memory leak with a
 /// business justification.
 public struct DivergenceLedger: Sendable {
 
@@ -27,8 +27,16 @@ public struct DivergenceLedger: Sendable {
         public let adapterWins: Int
         public let baseWins: Int
         public let ties: Int
+
+        public init(adapterWins: Int, baseWins: Int, ties: Int) {
+            self.adapterWins = Saturating.nonNegative(adapterWins)
+            self.baseWins = Saturating.nonNegative(baseWins)
+            self.ties = Saturating.nonNegative(ties)
+        }
+
         public var sampleCount: Int { Saturating.add(Saturating.add(adapterWins, baseWins), ties) }
-        /// Share of decided comparisons the base model won, `0...100`. Ties are excluded
+
+        /// Share of *decided* comparisons the base model won, `0...100`. Ties are excluded
         /// from the denominator: a tie is not evidence the adapter is regressing.
         public var regressionPercent: Int {
             Saturating.percent(baseWins, of: Saturating.add(adapterWins, baseWins))
@@ -36,11 +44,16 @@ public struct DivergenceLedger: Sendable {
     }
 
     public let capacity: Int
+    /// Oldest first. Deliberately a plain append-and-trim window rather than a ring buffer
+    /// with a write cursor: the ring was one index arithmetic bug away from silently
+    /// scrambling the order, and after a filtering pass (`invalidate(keeping:)`) the cursor
+    /// no longer points at the oldest slot at all. At a capacity of a few hundred entries
+    /// and a write rate of a handful per session, the O(n) trim is not worth defending a
+    /// cursor for.
     private var entries: [Entry] = []
-    private var writeIndex: Int = 0
 
-    /// `capacity` is clamped to at least 1 so the modulo in `record(_:)` can never see a
-    /// zero divisor.
+    /// `capacity` is clamped to at least 1, so the window always retains something and no
+    /// arithmetic here can see a zero.
     public init(capacity: Int) {
         self.capacity = max(1, capacity)
         entries.reserveCapacity(self.capacity)
@@ -49,20 +62,11 @@ public struct DivergenceLedger: Sendable {
     public var count: Int { entries.count }
 
     public mutating func record(_ entry: Entry) {
-        if entries.count < capacity {
-            entries.append(entry)
-            // `capacity >= 1`, so this remainder is safe. When the buffer has just filled,
-            // this lands on 0 — the correct next slot to overwrite.
-            writeIndex = entries.count % capacity
-            return
+        entries.append(entry)
+        // `capacity >= 1`, so this loop terminates with at least one entry retained.
+        while entries.count > capacity {
+            entries.removeFirst()
         }
-        guard entries.indices.contains(writeIndex) else {
-            // Unreachable given the invariant `writeIndex < capacity == entries.count`,
-            // but a bounds check is cheaper than a crash if that invariant ever breaks.
-            return
-        }
-        entries[writeIndex] = entry
-        writeIndex = (writeIndex &+ 1) % capacity
     }
 
     /// Summary over the retained window, optionally scoped to one adapter.
@@ -80,11 +84,16 @@ public struct DivergenceLedger: Sendable {
 
     /// Drops every entry recorded against a base model other than `installedBase`.
     ///
-    /// Called when the OS moves the base model. Same reasoning as the eval gate: a
-    /// comparison against the old base model says nothing about the new one, and leaving
-    /// it in the window would let stale data suppress a real regression signal.
+    /// Same reasoning as the eval gate: a comparison against the old base model says
+    /// nothing about the new one, and leaving it in the window would let stale data
+    /// suppress a real regression signal. Age order survives the filter.
     public mutating func invalidate(keeping installedBase: BaseModelVersion) {
-        entries = entries.filter { $0.baseModel == installedBase }
-        writeIndex = entries.count % capacity
+        entries.removeAll { $0.baseModel != installedBase }
+    }
+
+    /// Drops every entry for an adapter that is no longer installed, so the window cannot
+    /// keep reporting on something the device has already thrown away.
+    public mutating func forget(_ adapter: AdapterIdentifier) {
+        entries.removeAll { $0.adapter == adapter }
     }
 }

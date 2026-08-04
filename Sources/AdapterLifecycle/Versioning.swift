@@ -61,10 +61,11 @@ public struct BaseModelWindow: Sendable, Hashable, CustomStringConvertible {
         self.upperBoundExclusive = upperBoundExclusive
     }
 
-    /// True when no version can satisfy this window at all, because the upper bound is
-    /// at or below the lower bound. A window built from a bad remote config lands here,
-    /// and `relation(to:)` reports every version as `.installedTooNew`, which fails
-    /// closed to the base model.
+    /// True when no version can satisfy this window at all, because the upper bound is at
+    /// or below the lower bound. A window built from a bad remote config lands here, and
+    /// `relation(to:)` reports every version as incompatible in one direction or the other
+    /// — below the lower bound it reads `.installedTooOld`, at or above it `.installedTooNew`
+    /// — so resolution always fails closed to the base model.
     public var isEmpty: Bool {
         guard let upper = upperBoundExclusive else { return false }
         return upper <= lowerBound

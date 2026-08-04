@@ -17,6 +17,9 @@ public actor AdapterLifecycleCoordinator {
         /// quarantine entirely.
         public var quarantineThreshold: Int
         public var storageBudgetBytes: Int
+        /// Ceiling on resident artifacts regardless of size. Bundled and zero-byte
+        /// artifacts consume no budget, so bytes alone do not bound the resident set.
+        public var maximumResidents: Int
         public var divergenceCapacity: Int
 
         public init(
@@ -25,6 +28,7 @@ public actor AdapterLifecycleCoordinator {
             rollout: RolloutPolicy,
             quarantineThreshold: Int = 3,
             storageBudgetBytes: Int,
+            maximumResidents: Int = 32,
             divergenceCapacity: Int = 200
         ) {
             self.installationID = installationID
@@ -32,6 +36,7 @@ public actor AdapterLifecycleCoordinator {
             self.rollout = rollout
             self.quarantineThreshold = Saturating.nonNegative(quarantineThreshold)
             self.storageBudgetBytes = Saturating.nonNegative(storageBudgetBytes)
+            self.maximumResidents = max(1, maximumResidents)
             self.divergenceCapacity = max(1, divergenceCapacity)
         }
     }
@@ -51,10 +56,26 @@ public actor AdapterLifecycleCoordinator {
         public let current: BaseModelVersion
         /// Artifacts dropped from the cache because they cannot run on the new base.
         public let evictedIncompatible: [AdapterIdentifier]
-        /// Artifacts still resident whose eval result now describes a base model the
+        /// Artifacts **still resident** whose eval result now describes a base model the
         /// device is no longer running. They are not deleted — see `baseModelDidChange`.
+        /// Scoped to residents on purpose: naming an adapter the device does not have
+        /// would put a line in the log about something the user cannot see.
         public let evalsInvalidated: [AdapterIdentifier]
         public let divergenceSamplesDropped: Int
+
+        public init(
+            previous: BaseModelVersion,
+            current: BaseModelVersion,
+            evictedIncompatible: [AdapterIdentifier],
+            evalsInvalidated: [AdapterIdentifier],
+            divergenceSamplesDropped: Int
+        ) {
+            self.previous = previous
+            self.current = current
+            self.evictedIncompatible = evictedIncompatible
+            self.evalsInvalidated = evalsInvalidated
+            self.divergenceSamplesDropped = divergenceSamplesDropped
+        }
     }
 
     public struct ResidentSummary: Sendable, Equatable {
@@ -64,6 +85,22 @@ public actor AdapterLifecycleCoordinator {
         public let revocation: RevocationReason?
         public let consecutiveFailures: Int
         public let rolloutBucket: Int
+
+        public init(
+            descriptor: AdapterDescriptor,
+            isPinned: Bool,
+            evalVerdict: EvalVerdict,
+            revocation: RevocationReason?,
+            consecutiveFailures: Int,
+            rolloutBucket: Int
+        ) {
+            self.descriptor = descriptor
+            self.isPinned = isPinned
+            self.evalVerdict = evalVerdict
+            self.revocation = revocation
+            self.consecutiveFailures = consecutiveFailures
+            self.rolloutBucket = rolloutBucket
+        }
     }
 
     public struct LifecycleSnapshot: Sendable, Equatable {
@@ -75,6 +112,26 @@ public actor AdapterLifecycleCoordinator {
         public let utilisationPercent: Int
         public let exposurePercent: Int
         public let divergence: DivergenceLedger.Summary
+
+        public init(
+            installedBase: BaseModelVersion,
+            baseModelEpoch: Int,
+            residents: [ResidentSummary],
+            usedBytes: Int,
+            budgetBytes: Int,
+            utilisationPercent: Int,
+            exposurePercent: Int,
+            divergence: DivergenceLedger.Summary
+        ) {
+            self.installedBase = installedBase
+            self.baseModelEpoch = baseModelEpoch
+            self.residents = residents
+            self.usedBytes = usedBytes
+            self.budgetBytes = budgetBytes
+            self.utilisationPercent = utilisationPercent
+            self.exposurePercent = exposurePercent
+            self.divergence = divergence
+        }
     }
 
     // MARK: - State
@@ -88,6 +145,9 @@ public actor AdapterLifecycleCoordinator {
     private var evals: [AdapterIdentifier: EvalRecord] = [:]
     private var revocations: [AdapterIdentifier: RevocationReason] = [:]
     private var consecutiveFailures: [AdapterIdentifier: Int] = [:]
+    /// Which adapter is currently serving each task. The pin set is the union of these
+    /// values, so resolving one task never unpins another task's serving adapter.
+    private var servingByTask: [TaskIdentifier: AdapterIdentifier] = [:]
     private var divergence: DivergenceLedger
     private let engine = ResolutionEngine()
     private let provisioner: any AdapterProvisioning
@@ -99,7 +159,10 @@ public actor AdapterLifecycleCoordinator {
     ) {
         self.configuration = configuration
         self.installedBase = installedBase
-        self.storage = AdapterStorage(budgetBytes: configuration.storageBudgetBytes)
+        self.storage = AdapterStorage(
+            budgetBytes: configuration.storageBudgetBytes,
+            maximumResidents: configuration.maximumResidents
+        )
         self.divergence = DivergenceLedger(capacity: configuration.divergenceCapacity)
         self.provisioner = provisioner
     }
@@ -142,7 +205,7 @@ public actor AdapterLifecycleCoordinator {
             return .installed(evicted: evicted)
         case .alreadyResident:
             return .alreadyResident
-        case .rejectedExceedsBudget, .rejectedIncompatible:
+        case .rejectedExceedsBudget, .rejectedIncompatible, .rejectedTooManyResidents:
             return .rejected(outcome)
         }
     }
@@ -165,10 +228,12 @@ public actor AdapterLifecycleCoordinator {
         baseModelEpoch = Saturating.add(baseModelEpoch, 1)
 
         let evicted = storage.evictIncompatible(with: newVersion)
-        for id in evicted { consecutiveFailures.removeValue(forKey: id) }
+        for id in evicted { forget(id) }
 
+        // Scoped to what is still resident. An eval for an artifact the device never
+        // installed (or has just thrown away) is not something a reader can act on.
         let invalidated = evals.values
-            .filter { $0.evaluatedAgainstBase != newVersion }
+            .filter { storage.isResident($0.adapter) && $0.evaluatedAgainstBase != newVersion }
             .map(\.adapter)
             .sorted()
 
@@ -197,7 +262,26 @@ public actor AdapterLifecycleCoordinator {
         configuration.rollout = RolloutPolicy(exposurePercent: percent)
     }
 
-    public func evict(_ id: AdapterIdentifier) { storage.evict(id) }
+    public func evict(_ id: AdapterIdentifier) {
+        storage.evict(id)
+        forget(id)
+    }
+
+    /// Drops every trace of an adapter the device no longer has.
+    ///
+    /// Without this, `evals`, `revocations`, `consecutiveFailures`, `servingByTask` and the
+    /// divergence window all keep entries for artifacts that were evicted months ago. Each
+    /// one is small; together they are a slow leak in a process that is expected to run for
+    /// weeks, keyed by an identifier space the server controls.
+    private func forget(_ id: AdapterIdentifier) {
+        evals.removeValue(forKey: id)
+        revocations.removeValue(forKey: id)
+        consecutiveFailures.removeValue(forKey: id)
+        for (task, serving) in servingByTask where serving == id {
+            servingByTask.removeValue(forKey: task)
+        }
+        divergence.forget(id)
+    }
 
     // MARK: - Runtime feedback
 
@@ -228,14 +312,27 @@ public actor AdapterLifecycleCoordinator {
 
     /// The only question the app ever asks: what should serve this task right now?
     ///
-    /// Pins the winner so an in-flight fetch cannot evict the model currently in use, and
-    /// touches it for LRU. Both are side effects of asking, which is why this lives on
-    /// the actor and not on the pure engine.
+    /// Pins the winner so an in-flight fetch cannot evict a model currently in use, and
+    /// touches it for LRU. Both are side effects of asking, which is why this lives on the
+    /// actor and not on the pure engine.
+    ///
+    /// The pin set is the union across *all* tasks, not just this one. Pinning only the
+    /// winner of the task being resolved would unpin whatever is serving every other task,
+    /// which in a two-task app means asking about task B exposes task A's live adapter to
+    /// eviction on the next fetch.
     @discardableResult
     public func selection(for task: TaskIdentifier) -> ResolutionOutcome {
         let outcome = engine.resolve(task: task, input: resolutionInput())
-        storage.pinExclusively(outcome.selection.adapterIdentifier)
-        if let id = outcome.selection.adapterIdentifier { storage.touch(id) }
+        if let id = outcome.selection.adapterIdentifier {
+            servingByTask[task] = id
+            storage.touch(id)
+        } else {
+            servingByTask.removeValue(forKey: task)
+        }
+        // Drop tasks whose adapter is no longer resident before taking the union, so an
+        // evicted adapter cannot keep a stale pin alive.
+        servingByTask = servingByTask.filter { storage.isResident($0.value) }
+        storage.setPinned(exactly: Set(servingByTask.values))
         return outcome
     }
 

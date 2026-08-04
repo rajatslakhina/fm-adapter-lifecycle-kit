@@ -84,6 +84,12 @@ public struct ResolutionOutcome: Sendable, Equatable {
         public let adapter: AdapterIdentifier
         public let revision: Int
         public let rejection: AdapterRejection
+
+        public init(adapter: AdapterIdentifier, revision: Int, rejection: AdapterRejection) {
+            self.adapter = adapter
+            self.revision = revision
+            self.rejection = rejection
+        }
     }
 
     public let selection: ModelSelection
@@ -91,6 +97,11 @@ public struct ResolutionOutcome: Sendable, Equatable {
     /// Rendered directly by the demo app, and the thing you would ship to your logging
     /// backend when someone asks why a user is not getting the specialised model.
     public let audit: [AuditEntry]
+
+    public init(selection: ModelSelection, audit: [AuditEntry]) {
+        self.selection = selection
+        self.audit = audit
+    }
 }
 
 /// The decision itself: pure, synchronous, total.
