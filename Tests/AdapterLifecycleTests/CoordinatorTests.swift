@@ -102,7 +102,11 @@ final class CoordinatorTests: XCTestCase {
         XCTAssertEqual(report.previous, Fixture.base27)
         XCTAssertEqual(report.current, Fixture.base272)
         XCTAssertEqual(report.evictedIncompatible, [adapter.id])
-        XCTAssertEqual(report.evalsInvalidated, [adapter.id])
+        // Not "invalidated" — *forgotten*. The artifact was evicted, so its eval went with
+        // it rather than lingering as a stale record for something the device no longer
+        // has. `testACompatibleAdapterStillStandsDownUntilItIsReEvaluated` covers the other
+        // branch, where the adapter survives and its eval is merely stale.
+        XCTAssertEqual(report.evalsInvalidated, [])
 
         let after = await serving(coordinator)
         XCTAssertEqual(after, .baseModel(reason: .noAdapterForTask), "it was evicted, so nothing is left to consider")
@@ -278,5 +282,81 @@ final class CoordinatorTests: XCTestCase {
         await coordinator.baseModelDidChange(to: Fixture.base272)
         let afterSecond = await state(coordinator)
         XCTAssertEqual(afterSecond.baseModelEpoch, 2)
+    }
+
+    // MARK: - Multi-task pinning (regression)
+
+    /// Regression for a real bug. `selection(for:)` used to pin *only* the winner of the
+    /// task being resolved, which unpinned whatever was serving every other task. In a
+    /// two-task app that meant asking about task B exposed task A's live adapter to the
+    /// next fetch. The pin set is now the union across tasks.
+    func testResolvingASecondTaskDoesNotUnpinTheFirstTasksAdapter() async {
+        let coordinator = makeCoordinator(budgetMegabytes: 120)
+        let summariser = Fixture.descriptor("summariser", task: Fixture.summarise, revision: 1, megabytes: 50)
+        let tone = Fixture.descriptor("tone", task: Fixture.rewriteTone, revision: 1, megabytes: 50)
+        _ = await coordinator.provision(summariser)
+        _ = await coordinator.provision(tone)
+        await coordinator.recordEval(Fixture.passingEval(for: summariser))
+        await coordinator.recordEval(Fixture.passingEval(for: tone))
+
+        _ = await serving(coordinator, Fixture.summarise)
+        _ = await serving(coordinator, Fixture.rewriteTone)
+
+        let pinned = await state(coordinator)
+        XCTAssertEqual(pinned.residents.filter(\.isPinned).map(\.descriptor.id).sorted(), [summariser.id, tone.id])
+
+        // 50 + 50 = 100 of 120 used; a 50 MB newcomer needs an eviction and both incumbents
+        // are pinned, so it must be refused rather than taking one of them out.
+        let outcome = await coordinator.provision(Fixture.descriptor("newcomer", revision: 9, megabytes: 50))
+        guard case .rejected(.rejectedExceedsBudget) = outcome else { return XCTFail("got \(outcome)") }
+
+        let stillServing = await serving(coordinator, Fixture.summarise)
+        XCTAssertEqual(stillServing, .adapter(summariser.id, revision: 1), "task A's adapter survived task B's resolution")
+    }
+
+    /// Evicting an adapter must take its eval, revocation, failure count and divergence
+    /// samples with it. Otherwise every one of those dictionaries grows forever, keyed by
+    /// an identifier space the server controls.
+    func testEvictingAnAdapterForgetsEverythingKeyedToIt() async {
+        let coordinator = makeCoordinator()
+        let adapter = Fixture.descriptor("s", megabytes: 10)
+        _ = await coordinator.provision(adapter)
+        await coordinator.recordEval(Fixture.passingEval(for: adapter))
+        await coordinator.recordAdapterFailure(adapter.id)
+        await coordinator.revoke(adapter.id, reason: .killSwitch("INC-1"))
+        for _ in 0..<4 {
+            await coordinator.recordComparison(adapter: adapter.id, task: Fixture.summarise, winner: .adapter)
+        }
+        let before = await state(coordinator)
+        XCTAssertEqual(before.divergence.sampleCount, 4)
+
+        await coordinator.evict(adapter.id)
+        let after = await state(coordinator)
+        XCTAssertTrue(after.residents.isEmpty)
+        XCTAssertEqual(after.divergence.sampleCount, 0, "divergence samples for a gone adapter are meaningless")
+
+        // Re-provisioning must come back clean: no stale revocation, no stale failures, and
+        // no stale eval vouching for it.
+        _ = await coordinator.provision(adapter)
+        let reborn = await state(coordinator)
+        let summary = reborn.residents.first { $0.descriptor.id == adapter.id }
+        XCTAssertNil(summary?.revocation, "a re-fetched adapter must not inherit the old kill switch")
+        XCTAssertEqual(summary?.consecutiveFailures, 0)
+        XCTAssertEqual(summary?.evalVerdict, .missing, "and must not inherit the old eval either")
+    }
+
+    /// The report must only name adapters the device actually has. An eval for something
+    /// that was never installed is not something a reader can act on.
+    func testEvalInvalidationOnlyNamesResidentAdapters() async {
+        let coordinator = makeCoordinator()
+        let resident = Fixture.descriptor("resident", window: BaseModelWindow(from: Fixture.base27), megabytes: 10)
+        let neverInstalled = Fixture.descriptor("ghost", megabytes: 10)
+        _ = await coordinator.provision(resident)
+        await coordinator.recordEval(Fixture.passingEval(for: resident))
+        await coordinator.recordEval(Fixture.passingEval(for: neverInstalled))
+
+        let report = await coordinator.baseModelDidChange(to: Fixture.base271)
+        XCTAssertEqual(report.evalsInvalidated, [resident.id])
+        XCTAssertFalse(report.evalsInvalidated.contains(neverInstalled.id))
     }
 }

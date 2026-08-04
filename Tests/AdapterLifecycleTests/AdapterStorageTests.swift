@@ -31,17 +31,12 @@ final class AdapterStorageTests: XCTestCase {
         var store = storage(megabytes: 100)
         _ = store.admit(Fixture.descriptor("keep", megabytes: 40), installedBase: Fixture.base27)
 
-        let future = Fixture.descriptor(
-            "future", megabytes: 40,
-            distribution: .remote(locator: "https://example.invalid/f")
-        )
         let outdated = AdapterDescriptor(
             id: AdapterIdentifier("outdated"), task: Fixture.summarise, revision: 1,
             compatibility: BaseModelWindow(from: BaseModelVersion(28, 0, 0), upTo: BaseModelVersion(29, 0, 0)),
             payloadBytes: 40 * Fixture.megabyte,
             distribution: .remote(locator: "https://example.invalid/o")
         )
-        _ = future
         let outcome = store.admit(outdated, installedBase: Fixture.base27)
         guard case .rejectedIncompatible = outcome else { return XCTFail("got \(outcome)") }
         XCTAssertTrue(store.isResident(AdapterIdentifier("keep")))
@@ -54,7 +49,9 @@ final class AdapterStorageTests: XCTestCase {
         let outcome = store.admit(Fixture.descriptor("whale", megabytes: 400), installedBase: Fixture.base27)
         guard case let .rejectedExceedsBudget(payload, available) = outcome else { return XCTFail("got \(outcome)") }
         XCTAssertEqual(payload, 400 * Fixture.megabyte)
-        XCTAssertEqual(available, 100 * Fixture.megabyte)
+        // The free space, not the whole budget: 40 MB of the 100 MB budget is already in
+        // use, so "will not fit in 100 MB" would be a misleading thing to log.
+        XCTAssertEqual(available, 60 * Fixture.megabyte)
         XCTAssertTrue(store.isResident(AdapterIdentifier("keep")), "nothing should have been evicted for a lost cause")
     }
 
@@ -105,16 +102,68 @@ final class AdapterStorageTests: XCTestCase {
         XCTAssertTrue(store.isResident(AdapterIdentifier("serving")), "the model in active use must survive")
     }
 
-    func testPinExclusivelyProtectsOnlyTheServingAdapter() {
+    /// The pin set is a set, not a single identifier. An app with two tasks has two
+    /// adapters serving at once, and an earlier version of this API took one id — which
+    /// meant protecting task B's adapter silently exposed task A's to eviction.
+    func testSetPinnedExactlyProtectsEveryServingAdapterAtOnce() {
         var store = storage(megabytes: 200)
         _ = store.admit(Fixture.descriptor("a", megabytes: 10), installedBase: Fixture.base27)
         _ = store.admit(Fixture.descriptor("b", megabytes: 10), installedBase: Fixture.base27)
-        store.setPinned(true, for: AdapterIdentifier("a"))
-        store.pinExclusively(AdapterIdentifier("b"))
-        XCTAssertEqual(store.resident(AdapterIdentifier("a"))?.isPinned, false)
+        _ = store.admit(Fixture.descriptor("c", megabytes: 10), installedBase: Fixture.base27)
+
+        store.setPinned(exactly: [AdapterIdentifier("a"), AdapterIdentifier("b")])
+        XCTAssertEqual(store.resident(AdapterIdentifier("a"))?.isPinned, true)
         XCTAssertEqual(store.resident(AdapterIdentifier("b"))?.isPinned, true)
-        store.pinExclusively(nil)
-        XCTAssertEqual(store.resident(AdapterIdentifier("b"))?.isPinned, false)
+        XCTAssertEqual(store.resident(AdapterIdentifier("c"))?.isPinned, false)
+
+        store.setPinned(exactly: [AdapterIdentifier("c")])
+        XCTAssertEqual(store.resident(AdapterIdentifier("a"))?.isPinned, false)
+        XCTAssertEqual(store.resident(AdapterIdentifier("c"))?.isPinned, true)
+
+        store.setPinned(exactly: [])
+        XCTAssertEqual(store.resident(AdapterIdentifier("c"))?.isPinned, false)
+    }
+
+    /// Bytes alone do not bound the resident set: bundled artifacts skip the budget
+    /// entirely and a zero-byte remote artifact never moves `usedBytes`, so without a
+    /// count ceiling the cache grows without limit while looking empty.
+    func testResidentCountIsBoundedEvenWhenNothingConsumesBytes() {
+        var store = AdapterStorage(budgetBytes: 100 * Fixture.megabyte, maximumResidents: 3)
+        for index in 0..<3 {
+            let outcome = store.admit(
+                Fixture.descriptor("bundled-\(index)", megabytes: 500, distribution: .bundled),
+                installedBase: Fixture.base27
+            )
+            XCTAssertEqual(outcome, .admitted(evicted: []))
+        }
+        XCTAssertEqual(store.usedBytes, 0, "bundled artifacts consume no managed bytes")
+        XCTAssertEqual(
+            store.admit(Fixture.descriptor("bundled-3", megabytes: 500, distribution: .bundled), installedBase: Fixture.base27),
+            .rejectedTooManyResidents(limit: 3)
+        )
+        XCTAssertEqual(store.residentIdentifiers.count, 3)
+    }
+
+    func testZeroByteArtifactsCannotGrowTheResidentSetForever() {
+        var store = AdapterStorage(budgetBytes: 10 * Fixture.megabyte, maximumResidents: 4)
+        for index in 0..<4 {
+            _ = store.admit(Fixture.descriptor("empty-\(index)", megabytes: 0), installedBase: Fixture.base27)
+        }
+        XCTAssertEqual(store.usedBytes, 0)
+        XCTAssertEqual(
+            store.admit(Fixture.descriptor("empty-4", megabytes: 0), installedBase: Fixture.base27),
+            .rejectedTooManyResidents(limit: 4)
+        )
+    }
+
+    func testMaximumResidentsIsClampedToAtLeastOne() {
+        var store = AdapterStorage(budgetBytes: 100 * Fixture.megabyte, maximumResidents: 0)
+        XCTAssertEqual(store.maximumResidents, 1)
+        XCTAssertEqual(store.admit(Fixture.descriptor("a", megabytes: 1), installedBase: Fixture.base27), .admitted(evicted: []))
+        XCTAssertEqual(
+            store.admit(Fixture.descriptor("b", megabytes: 1), installedBase: Fixture.base27),
+            .rejectedTooManyResidents(limit: 1)
+        )
     }
 
     /// Bundled artifacts already cost app size; evicting one frees nothing, so counting

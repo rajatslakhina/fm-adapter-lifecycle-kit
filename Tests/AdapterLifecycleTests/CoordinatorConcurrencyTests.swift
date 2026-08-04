@@ -123,44 +123,109 @@ final class CoordinatorConcurrencyTests: XCTestCase {
         XCTAssertTrue(snapshot.residents.isEmpty)
     }
 
-    /// Many concurrent provisions against one coordinator. The point is not throughput —
-    /// it is that actor serialisation makes the accounting exact, so the byte total is the
-    /// sum of what was admitted and never a torn read.
-    func testConcurrentProvisionsKeepStorageAccountingExact() async {
+    /// A base model change racing a *fleet* of in-flight fetches.
+    ///
+    /// This is the interleaving-sensitive one. Every provisioner suspends, so all forty
+    /// fetches are genuinely mid-flight when the base model moves; each then resumes and
+    /// either wins or is superseded depending on which side of the epoch bump it landed.
+    /// The assertion is not "nothing crashed" — it is the **postcondition that must hold
+    /// for every possible interleaving**: whatever the scheduler chose, no artifact that
+    /// is incompatible with the final base model may be resident, and every provision must
+    /// have reported one of the two legal outcomes rather than silently succeeding on a
+    /// stale check.
+    func testABaseModelChangeRacingManyFetchesLeavesNoIncompatibleResident() async {
         let coordinator = AdapterLifecycleCoordinator(
-            configuration: Fixture.configuration(budgetMegabytes: 500),
-            installedBase: Fixture.base27
+            configuration: Fixture.configuration(budgetMegabytes: 2_000, quarantineThreshold: 3),
+            installedBase: Fixture.base27,
+            provisioner: YieldingProvisioner(yields: 6)
         )
-        await withTaskGroup(of: Void.self) { group in
-            for index in 0..<40 {
-                group.addTask {
-                    _ = await coordinator.provision(Fixture.descriptor("adapter-\(index)", megabytes: 10))
-                }
+        // Valid only for the old base. If the epoch guard were removed, the ones that
+        // resumed after the change would be admitted against a device that cannot run them.
+        let doomed = (0..<40).map {
+            Fixture.descriptor("old-\($0)", window: BaseModelWindow(from: Fixture.base27, upTo: Fixture.base271), megabytes: 5)
+        }
+
+        let outcomes = await withTaskGroup(of: AdapterLifecycleCoordinator.ProvisionOutcome.self) { group in
+            for descriptor in doomed {
+                group.addTask { await coordinator.provision(descriptor) }
+            }
+            group.addTask {
+                // The concurrent writer. Yields first so it lands in the middle of the pack
+                // rather than before or after all of them.
+                for _ in 0..<3 { await Task.yield() }
+                await coordinator.baseModelDidChange(to: Fixture.base271)
+                return .alreadyResident   // sentinel, filtered out below
+            }
+            var collected: [AdapterLifecycleCoordinator.ProvisionOutcome] = []
+            for await outcome in group { collected.append(outcome) }
+            return collected
+        }
+
+        for outcome in outcomes {
+            switch outcome {
+            case .installed, .supersededByBaseModelChange, .alreadyResident, .rejected:
+                continue
+            case let .fetchFailed(detail):
+                XCTFail("no fetch should have failed: \(detail)")
             }
         }
+
         let snapshot = await coordinator.snapshot()
-        XCTAssertEqual(snapshot.residents.count, 40)
-        XCTAssertEqual(snapshot.usedBytes, 400 * Fixture.megabyte)
-        XCTAssertLessThanOrEqual(snapshot.usedBytes, snapshot.budgetBytes)
+        XCTAssertEqual(snapshot.installedBase, Fixture.base271)
+        for resident in snapshot.residents {
+            XCTFail("nothing valid only for 27.0.0 may survive a move to 27.1.0: \(resident.descriptor.id)")
+        }
+        XCTAssertEqual(snapshot.usedBytes, 0)
     }
 
-    /// Under a budget that cannot hold everything, concurrency must not let the total
-    /// drift above the ceiling — the invariant an unsynchronised cache breaks first.
-    func testConcurrentProvisionsNeverExceedTheBudget() async {
+    /// Concurrent provisions racing concurrent resolutions and failure reports, under a
+    /// budget too small to hold everything. Three different mutators on one actor.
+    ///
+    /// The postconditions are the storage invariants, and they are checked against the
+    /// *final* state rather than against a predicted one — a test that predicted the exact
+    /// surviving set would be asserting a scheduler order it has no right to expect.
+    func testInvariantsHoldUnderMixedConcurrentMutation() async {
+        let budgetMegabytes = 100
         let coordinator = AdapterLifecycleCoordinator(
-            configuration: Fixture.configuration(budgetMegabytes: 100),
-            installedBase: Fixture.base27
+            configuration: Fixture.configuration(budgetMegabytes: budgetMegabytes),
+            installedBase: Fixture.base27,
+            provisioner: YieldingProvisioner(yields: 3)
         )
         await withTaskGroup(of: Void.self) { group in
             for index in 0..<50 {
+                let descriptor = Fixture.descriptor("adapter-\(index)", megabytes: 30)
                 group.addTask {
-                    _ = await coordinator.provision(Fixture.descriptor("adapter-\(index)", megabytes: 30))
+                    _ = await coordinator.provision(descriptor)
+                    await coordinator.recordEval(Fixture.passingEval(for: descriptor))
                 }
+                group.addTask { _ = await coordinator.selection(for: Fixture.summarise) }
+                group.addTask { await coordinator.recordAdapterFailure(descriptor.id) }
             }
         }
+
         let snapshot = await coordinator.snapshot()
-        XCTAssertLessThanOrEqual(snapshot.usedBytes, 100 * Fixture.megabyte)
-        XCTAssertGreaterThan(snapshot.residents.count, 0, "something should have survived")
-        XCTAssertLessThanOrEqual(snapshot.residents.count, 3, "100MB cannot hold four 30MB artifacts")
+        XCTAssertLessThanOrEqual(snapshot.usedBytes, budgetMegabytes * Fixture.megabyte, "the budget was never exceeded")
+        XCTAssertGreaterThanOrEqual(snapshot.usedBytes, 0)
+        XCTAssertLessThanOrEqual(snapshot.residents.count, 3, "100 MB cannot hold four 30 MB artifacts")
+        // Accounting must be exactly the sum of what is actually resident — a torn
+        // read-modify-write would show up here as a mismatch.
+        let recomputed = snapshot.residents
+            .filter(\.descriptor.consumesManagedStorage)
+            .reduce(0) { $0 + $1.descriptor.payloadBytes }
+        XCTAssertEqual(snapshot.usedBytes, recomputed, "usedBytes drifted from the resident set")
+        // At most one adapter can be pinned for the single task involved.
+        XCTAssertLessThanOrEqual(snapshot.residents.filter(\.isPinned).count, 1)
+    }
+}
+
+/// A provisioner that suspends several times before returning, so a task group's fetches
+/// are genuinely in flight simultaneously instead of each running to completion before the
+/// next starts. `AlreadyResidentProvisioner` never suspends, which makes a "concurrency"
+/// test using it byte-for-byte identical to a sequential loop.
+private struct YieldingProvisioner: AdapterProvisioning {
+    let yields: Int
+
+    func fetch(_ descriptor: AdapterDescriptor) async throws {
+        for _ in 0..<max(1, yields) { await Task.yield() }
     }
 }

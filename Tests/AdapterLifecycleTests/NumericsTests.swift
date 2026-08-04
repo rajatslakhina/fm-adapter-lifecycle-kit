@@ -30,12 +30,12 @@ final class NumericsTests: XCTestCase {
         XCTAssertEqual(Saturating.percent(1, of: -10), 0)
     }
 
-    func testPercentClampsAndRounds() {
+    func testPercentClampsAndTruncates() {
         XCTAssertEqual(Saturating.percent(50, of: 200), 25)
         XCTAssertEqual(Saturating.percent(200, of: 200), 100)
         XCTAssertEqual(Saturating.percent(500, of: 200), 100)
         XCTAssertEqual(Saturating.percent(-5, of: 200), 0)
-        XCTAssertEqual(Saturating.percent(1, of: 3), 33)
+        XCTAssertEqual(Saturating.percent(1, of: 3), 33, "integer division truncates; nothing here rounds")
     }
 
     /// `value * 100` overflows here, so the integer path is unusable and the helper has
