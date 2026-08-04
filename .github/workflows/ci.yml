@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux · Swift 6
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      # `-warnings-as-errors` is what makes "zero warnings" a machine-checked claim
+      # rather than a sentence in a README.
+      - name: Build
+        run: swift build -Xswiftc -warnings-as-errors
+      - name: Test
+        run: swift test -Xswiftc -warnings-as-errors
+
+  apple:
+    name: macOS · Swift 6
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      # The macOS job is not a duplicate of the Linux one: SwiftUI exists here, so this
+      # is the run that actually compiles the AdapterLifecycleUI console.
+      - name: Build
+        run: swift build -Xswiftc -warnings-as-errors
+      - name: Test
+        run: swift test -Xswiftc -warnings-as-errors
