@@ -202,6 +202,11 @@ public actor AdapterLifecycleCoordinator {
         let outcome = storage.admit(descriptor, installedBase: installedBase)
         switch outcome {
         case let .admitted(evicted):
+            // The LRU path inside `admit` evicts too, and those artifacts need forgetting
+            // exactly as much as an explicit `evict(_:)` does. Missing this is how a
+            // re-fetched adapter silently inherits a kill switch someone cleared months
+            // ago — see `testLRUEvictionDuringProvisionAlsoForgets`.
+            for id in evicted { forget(id) }
             return .installed(evicted: evicted)
         case .alreadyResident:
             return .alreadyResident
@@ -258,8 +263,14 @@ public actor AdapterLifecycleCoordinator {
 
     public func clearRevocation(_ id: AdapterIdentifier) { revocations.removeValue(forKey: id) }
 
+    /// Ramps the rollout, **preserving the configured bucketing**.
+    ///
+    /// Rebuilding the policy with `RolloutPolicy(exposurePercent:)` here would silently
+    /// substitute the default bucketing, so an adopter who injected their own would have it
+    /// discarded on the first ramp — re-bucketing every install, which is the exact
+    /// monotonicity violation this package is built to prevent.
     public func setExposure(percent: Int) {
-        configuration.rollout = RolloutPolicy(exposurePercent: percent)
+        configuration.rollout = configuration.rollout.withExposure(percent: percent)
     }
 
     public func evict(_ id: AdapterIdentifier) {
@@ -293,7 +304,10 @@ public actor AdapterLifecycleCoordinator {
     /// An adapter served a request successfully. Resets the quarantine counter, so a
     /// single transient failure never accumulates into a permanent quarantine.
     public func recordAdapterSuccess(_ id: AdapterIdentifier) {
-        consecutiveFailures[id] = 0
+        // Remove rather than write a zero. Resolution already reads a missing key as zero,
+        // so storing one only creates a permanent entry for every adapter that ever served,
+        // keyed by an identifier space the server controls.
+        consecutiveFailures.removeValue(forKey: id)
     }
 
     /// Records an online adapter-versus-base comparison, tagged with the base model it

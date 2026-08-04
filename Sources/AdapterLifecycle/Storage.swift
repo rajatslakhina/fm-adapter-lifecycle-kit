@@ -105,14 +105,25 @@ public struct AdapterStorage: Sendable {
             return .rejectedIncompatible(window: descriptor.compatibility, installed: installedBase)
         }
 
-        guard residents.count < maximumResidents else {
-            return .rejectedTooManyResidents(limit: maximumResidents)
+        var evicted: [AdapterIdentifier] = []
+
+        // Count pressure gets the same treatment as byte pressure: evict, then refuse only
+        // if nothing is evictable. Refusing outright would wedge the cache permanently —
+        // once at the ceiling, nothing could ever be admitted again even with every
+        // resident cold and unpinned.
+        while residents.count >= maximumResidents {
+            guard let victim = nextEvictionVictim(installedBase: installedBase) else {
+                // Everything resident is pinned or bundled, so the ceiling is real.
+                return .rejectedTooManyResidents(limit: maximumResidents)
+            }
+            residents.removeValue(forKey: victim)
+            evicted.append(victim)
         }
 
         guard descriptor.consumesManagedStorage else {
             // Bundled: no budget to check, it is already on the device.
             insert(descriptor)
-            return .admitted(evicted: [])
+            return .admitted(evicted: evicted)
         }
 
         let payload = descriptor.payloadBytes
@@ -122,8 +133,6 @@ public struct AdapterStorage: Sendable {
         guard payload <= budgetBytes else {
             return .rejectedExceedsBudget(payloadBytes: payload, availableBytes: availableBytes)
         }
-
-        var evicted: [AdapterIdentifier] = []
         // Each iteration removes exactly one resident or breaks, and `residents` is
         // finite, so this terminates.
         while Saturating.add(usedBytes, payload) > budgetBytes {

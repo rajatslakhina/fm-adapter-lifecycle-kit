@@ -72,15 +72,30 @@ public struct RolloutPolicy: Sendable {
     /// sticky bucketing across app upgrades is destroyed. Keeping the bucket independent of
     /// the threshold gives the invariant that widening exposure only ever *adds* installs.
     ///
-    /// The result is clamped because `bucketing` is a public seam: a third-party
-    /// implementation returning a negative or out-of-range value must not be able to make
+    /// The result is sanitised because `bucketing` is a public seam: a third-party
+    /// implementation returning an out-of-range value must not be able to make
     /// `includes(installationID:adapter:)` nonsensical.
+    ///
+    /// Out-of-range in **either** direction maps to the last bucket, which fails *closed*.
+    /// Clamping negatives to `0` would have failed open — bucket 0 is inside every nonzero
+    /// exposure, so one broken bucketing would turn a 1% rollout into 100%. A bug in
+    /// someone else's hash should shrink a rollout, never widen it.
     public func bucket(installationID: String, adapter: AdapterIdentifier) -> Int {
         let raw = bucketing.bucket(installationID: installationID, adapter: adapter)
-        return min(Self.bucketCount - 1, max(0, raw))
+        guard raw >= 0, raw < Self.bucketCount else { return Self.bucketCount - 1 }
+        return raw
     }
 
     public func includes(installationID: String, adapter: AdapterIdentifier) -> Bool {
         bucket(installationID: installationID, adapter: adapter) < exposurePercent
+    }
+
+    /// A copy at a new exposure, carrying the same bucketing.
+    ///
+    /// The reason this exists rather than callers constructing a fresh policy: rebuilding
+    /// with the default bucketing on every ramp would re-shuffle every install, and the
+    /// bug would only show up as drifting exposure metrics weeks later.
+    public func withExposure(percent: Int) -> RolloutPolicy {
+        RolloutPolicy(exposurePercent: percent, bucketing: bucketing)
     }
 }
