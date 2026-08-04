@@ -154,24 +154,24 @@ Stated precisely, because "it builds" and "it runs" are different claims and con
 them is the most common way a portfolio repo overstates itself.
 
 **What was verified.** `swift build -Xswiftc -warnings-as-errors` and
-`swift test -Xswiftc -warnings-as-errors` both pass. **129 tests, 0 failures, 0 warnings**,
+`swift test -Xswiftc -warnings-as-errors` both pass. **128 tests, 0 failures, 0 warnings**,
 from a clean tree (`.build` removed first — an incremental `swift build` compiles nothing
 and still prints `Build complete!`, so it is evidence of nothing).
 
 Both jobs on the [Actions tab](https://github.com/rajatslakhina/fm-adapter-lifecycle-kit/actions)
-run exactly those two commands, so the zero-warning claim is machine-enforced rather than
-asserted here:
+run those two commands, so the zero-warning claim is machine-enforced rather than asserted
+here:
 
 | Job | What it proves |
 |---|---|
 | **Linux · Swift 6** (`swift:6.0` container) | The policy core has no Apple dependency at all. If anything in `AdapterLifecycle` ever reaches for Foundation Models, this job goes red. |
 | **macOS · Swift 6** (`macos-15`) | SwiftUI exists here, so this is the run that actually compiles the `AdapterLifecycleUI` console — and it additionally builds for `generic/platform=iOS Simulator`, so the `.iOS(.v17)` line in `Package.swift` is a checked claim rather than an assertion. |
 
-Test distribution: `AdapterStorageTests` 17 · `CoordinatorTests` 16 ·
-`ResolutionEngineTests` 15 · `EvalGateTests` 14 · `PresentationTests` 12 ·
-`RolloutPolicyTests` 12 · `DivergenceLedgerTests` 9 · `NumericsTests` 8 ·
-`TokenOverlapF1ScorerTests` 8 · `VersioningTests` 8 · `OfflineEvalRunnerTests` 5 ·
-`CoordinatorConcurrencyTests` 5.
+Test distribution: `CoordinatorTests` 18 · `ResolutionEngineTests` 15 ·
+`EvalGateTests` 14 · `AdapterStorageTests` 13 · `RolloutPolicyTests` 13 ·
+`PresentationTests` 12 · `DivergenceLedgerTests` 9 · `NumericsTests` 8 ·
+`TokenOverlapF1ScorerTests` 8 · `VersioningTests` 8 ·
+`CoordinatorConcurrencyTests` 5 · `OfflineEvalRunnerTests` 5.
 
 **What was *not* verified.** The companion demo app was **not** run on a Simulator, and
 **no screenshots of it exist**. Computer-use access to Xcode and Simulator was requested
