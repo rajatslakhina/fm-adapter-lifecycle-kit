@@ -39,3 +39,14 @@ jobs:
         run: swift build -Xswiftc -warnings-as-errors
       - name: Test
         run: swift test -Xswiftc -warnings-as-errors
+
+      # `Package.swift` declares `.iOS(.v17)`, so something has to actually build for iOS
+      # or that declaration is an unchecked claim. `generic/platform=iOS Simulator` needs
+      # no simulator *runtime* to be installed on the runner, unlike a named device.
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild -list
+          xcodebuild build \
+            -scheme AdapterLifecycleUI \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO
