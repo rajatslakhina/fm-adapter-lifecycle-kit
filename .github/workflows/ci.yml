@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Toolchain
         run: swift --version
       # `-warnings-as-errors` is what makes "zero warnings" a machine-checked claim
@@ -30,7 +30,7 @@ jobs:
     name: macOS · Swift 6
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Toolchain
         run: swift --version
       # The macOS job is not a duplicate of the Linux one: SwiftUI exists here, so this
