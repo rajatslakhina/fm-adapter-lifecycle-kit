@@ -85,22 +85,42 @@ final class RolloutPolicyTests: XCTestCase {
     }
 
     /// `bucketing` is a public seam, so a third-party implementation returning garbage must
-    /// not be able to make `includes` nonsensical — e.g. a negative bucket would otherwise
-    /// be `< 0`, putting an install into a 0% rollout.
-    func testAnOutOfRangeBucketFromAThirdPartyImplementationIsClamped() {
-        let negative = RolloutPolicy(exposurePercent: 0, bucketing: OutOfRangeBucketing(value: -5))
-        XCTAssertEqual(negative.bucket(installationID: "x", adapter: summariser), 0)
+    /// not be able to make `includes` nonsensical — and crucially it must fail **closed**.
+    /// Clamping negatives to bucket 0 would fail *open*: bucket 0 is inside every nonzero
+    /// exposure, so one broken hash would turn a 1% rollout into a 100% one. Tested at 5%,
+    /// not at 0%, because at 0% nothing is included either way and the assertion would be
+    /// unable to tell the two behaviours apart.
+    func testAnOutOfRangeBucketFailsClosedRatherThanOpen() {
+        let negative = RolloutPolicy(exposurePercent: 5, bucketing: OutOfRangeBucketing(value: -5))
+        XCTAssertEqual(negative.bucket(installationID: "x", adapter: summariser), 99)
         XCTAssertFalse(
             negative.includes(installationID: "x", adapter: summariser),
-            "a negative bucket must not sneak an install into a 0% rollout"
+            "a negative bucket must not sneak an install into a 5% rollout"
         )
 
-        let huge = RolloutPolicy(exposurePercent: 100, bucketing: OutOfRangeBucketing(value: 10_000))
+        let huge = RolloutPolicy(exposurePercent: 5, bucketing: OutOfRangeBucketing(value: 10_000))
         XCTAssertEqual(huge.bucket(installationID: "x", adapter: summariser), 99)
-        XCTAssertTrue(
-            huge.includes(installationID: "x", adapter: summariser),
-            "and an oversized bucket must not exclude an install from a 100% rollout"
+        XCTAssertFalse(huge.includes(installationID: "x", adapter: summariser))
+
+        // ...and a broken bucketing still cannot exclude anyone from a full rollout.
+        let full = RolloutPolicy(exposurePercent: 100, bucketing: OutOfRangeBucketing(value: -5))
+        XCTAssertTrue(full.includes(installationID: "x", adapter: summariser))
+    }
+
+    /// Ramping the rollout must carry the configured bucketing. Rebuilding the policy with
+    /// the default would re-shuffle every install on the first ramp — the exact
+    /// monotonicity violation the design exists to prevent, showing up weeks later as
+    /// drifting exposure metrics.
+    func testWithExposurePreservesTheInjectedBucketing() {
+        let custom = RolloutPolicy(exposurePercent: 0, bucketing: ConstantBucketing(value: 7))
+        let ramped = custom.withExposure(percent: 50)
+        XCTAssertEqual(ramped.exposurePercent, 50)
+        XCTAssertEqual(
+            ramped.bucket(installationID: "x", adapter: summariser), 7,
+            "the injected bucketing was replaced by the default"
         )
+        // Control: the default bucketing gives a different answer for the same input.
+        XCTAssertNotEqual(RolloutPolicy(exposurePercent: 50).bucket(installationID: "x", adapter: summariser), 7)
     }
 
     func testFullExposureIncludesEveryone() {

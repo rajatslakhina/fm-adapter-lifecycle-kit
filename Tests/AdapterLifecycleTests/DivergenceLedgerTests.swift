@@ -40,7 +40,7 @@ final class DivergenceLedgerTests: XCTestCase {
         XCTAssertEqual(summary.adapterWins, 0)
     }
 
-    func testWritesKeepCyclingAfterTheBufferHasWrapped() {
+    func testWritesKeepLandingAfterTheWindowHasFilled() {
         var ledger = DivergenceLedger(capacity: 3)
         for _ in 0..<3 { ledger.record(entry(.base)) }
         for _ in 0..<9 { ledger.record(entry(.adapter)) }
@@ -49,7 +49,7 @@ final class DivergenceLedgerTests: XCTestCase {
         XCTAssertEqual(ledger.summary().baseWins, 0)
     }
 
-    func testCapacityIsClampedSoTheRingArithmeticCannotDivideByZero() {
+    func testCapacityIsClampedToAtLeastOne() {
         var zero = DivergenceLedger(capacity: 0)
         XCTAssertEqual(zero.capacity, 1)
         zero.record(entry(.adapter))
@@ -110,7 +110,7 @@ final class DivergenceLedgerTests: XCTestCase {
         ledger.invalidate(keeping: Fixture.base271)
         XCTAssertEqual(ledger.count, 0)
         for _ in 0..<6 { ledger.record(entry(.base, base: Fixture.base271)) }
-        XCTAssertEqual(ledger.count, 4, "write index must have been reset into range")
+        XCTAssertEqual(ledger.count, 4, "the window must refill and re-trim normally after a purge")
         XCTAssertEqual(ledger.summary().baseWins, 4)
     }
 }

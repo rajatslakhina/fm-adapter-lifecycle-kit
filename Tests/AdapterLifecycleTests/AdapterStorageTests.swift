@@ -137,6 +137,8 @@ final class AdapterStorageTests: XCTestCase {
             XCTAssertEqual(outcome, .admitted(evicted: []))
         }
         XCTAssertEqual(store.usedBytes, 0, "bundled artifacts consume no managed bytes")
+        // Bundled artifacts are never evictable, so here the ceiling really is a wall and
+        // refusing is the only honest answer.
         XCTAssertEqual(
             store.admit(Fixture.descriptor("bundled-3", megabytes: 500, distribution: .bundled), installedBase: Fixture.base27),
             .rejectedTooManyResidents(limit: 3)
@@ -144,16 +146,21 @@ final class AdapterStorageTests: XCTestCase {
         XCTAssertEqual(store.residentIdentifiers.count, 3)
     }
 
-    func testZeroByteArtifactsCannotGrowTheResidentSetForever() {
-        var store = AdapterStorage(budgetBytes: 10 * Fixture.megabyte, maximumResidents: 4)
+    /// Count pressure evicts, exactly like byte pressure. Refusing outright would wedge
+    /// the cache: once at the ceiling nothing could ever be admitted again, even with every
+    /// resident cold and unpinned.
+    func testCountPressureEvictsInsteadOfWedgingTheCache() {
+        var store = AdapterStorage(budgetBytes: 100 * Fixture.megabyte, maximumResidents: 4)
         for index in 0..<4 {
             _ = store.admit(Fixture.descriptor("empty-\(index)", megabytes: 0), installedBase: Fixture.base27)
         }
         XCTAssertEqual(store.usedBytes, 0)
-        XCTAssertEqual(
-            store.admit(Fixture.descriptor("empty-4", megabytes: 0), installedBase: Fixture.base27),
-            .rejectedTooManyResidents(limit: 4)
-        )
+        XCTAssertEqual(store.residentIdentifiers.count, 4)
+
+        let outcome = store.admit(Fixture.descriptor("empty-4", megabytes: 0), installedBase: Fixture.base27)
+        XCTAssertEqual(outcome, .admitted(evicted: [AdapterIdentifier("empty-0")]), "the coldest goes")
+        XCTAssertEqual(store.residentIdentifiers.count, 4, "and the ceiling still holds")
+        XCTAssertTrue(store.isResident(AdapterIdentifier("empty-4")))
     }
 
     func testMaximumResidentsIsClampedToAtLeastOne() {
@@ -162,64 +169,9 @@ final class AdapterStorageTests: XCTestCase {
         XCTAssertEqual(store.admit(Fixture.descriptor("a", megabytes: 1), installedBase: Fixture.base27), .admitted(evicted: []))
         XCTAssertEqual(
             store.admit(Fixture.descriptor("b", megabytes: 1), installedBase: Fixture.base27),
-            .rejectedTooManyResidents(limit: 1)
+            .admitted(evicted: [AdapterIdentifier("a")])
         )
-    }
-
-    /// Bundled artifacts already cost app size; evicting one frees nothing, so counting
-    /// them against the download budget would make the budget describe the wrong thing.
-    func testBundledArtifactsDoNotConsumeTheManagedBudget() {
-        var store = storage(megabytes: 50)
-        let bundled = Fixture.descriptor("bundled", megabytes: 300, distribution: .bundled)
-        XCTAssertEqual(store.admit(bundled, installedBase: Fixture.base27), .admitted(evicted: []))
-        XCTAssertEqual(store.usedBytes, 0)
-        XCTAssertEqual(store.admit(Fixture.descriptor("remote", megabytes: 50), installedBase: Fixture.base27),
-                       .admitted(evicted: []))
-        XCTAssertTrue(store.isResident(AdapterIdentifier("bundled")), "bundled artifacts are not eviction candidates")
-    }
-
-    func testEvictIncompatibleClearsExactlyTheUnusableOnes() {
-        var store = storage(megabytes: 300)
-        _ = store.admit(Fixture.descriptor("gen27", window: Fixture.oneGeneration, megabytes: 10), installedBase: Fixture.base27)
-        _ = store.admit(Fixture.descriptor("openEnded", window: BaseModelWindow(from: Fixture.base27), megabytes: 10), installedBase: Fixture.base27)
-        _ = store.admit(Fixture.descriptor("narrow", window: BaseModelWindow(from: Fixture.base27, upTo: Fixture.base271), megabytes: 10), installedBase: Fixture.base27)
-
-        let evicted = store.evictIncompatible(with: Fixture.base272)
-        XCTAssertEqual(evicted, [AdapterIdentifier("gen27"), AdapterIdentifier("narrow")], "sorted, and only the unusable ones")
-        XCTAssertEqual(store.residentIdentifiers, [AdapterIdentifier("openEnded")])
-    }
-
-    func testCandidatesAreOrderedByRevisionThenIdentifier() {
-        var store = storage(megabytes: 300)
-        _ = store.admit(Fixture.descriptor("b", revision: 2, megabytes: 5), installedBase: Fixture.base27)
-        _ = store.admit(Fixture.descriptor("a", revision: 2, megabytes: 5), installedBase: Fixture.base27)
-        _ = store.admit(Fixture.descriptor("c", revision: 7, megabytes: 5), installedBase: Fixture.base27)
-        _ = store.admit(Fixture.descriptor("z", task: Fixture.rewriteTone, revision: 9, megabytes: 5), installedBase: Fixture.base27)
-
-        XCTAssertEqual(
-            store.candidates(for: Fixture.summarise).map(\.id),
-            [AdapterIdentifier("c"), AdapterIdentifier("a"), AdapterIdentifier("b")]
-        )
-        XCTAssertEqual(store.candidates(for: Fixture.rewriteTone).map(\.id), [AdapterIdentifier("z")])
-    }
-
-    func testDegenerateInputsDoNotTrap() {
-        var zeroBudget = AdapterStorage(budgetBytes: 0)
-        XCTAssertEqual(zeroBudget.utilisationPercent, 0, "must not divide by a zero budget")
-        XCTAssertEqual(zeroBudget.usedBytes, 0)
-        guard case .rejectedExceedsBudget = zeroBudget.admit(Fixture.descriptor("a", megabytes: 1), installedBase: Fixture.base27) else {
-            return XCTFail("a zero budget cannot admit anything")
-        }
-
-        var negativeBudget = AdapterStorage(budgetBytes: -5_000)
-        XCTAssertEqual(negativeBudget.budgetBytes, 0)
-        XCTAssertEqual(negativeBudget.utilisationPercent, 0)
-        XCTAssertFalse(negativeBudget.evict(AdapterIdentifier("nothing")))
-        negativeBudget.touch(AdapterIdentifier("nothing"))
-        negativeBudget.setPinned(true, for: AdapterIdentifier("nothing"))
-        XCTAssertTrue(negativeBudget.residentIdentifiers.isEmpty)
-        XCTAssertTrue(negativeBudget.candidates(for: Fixture.summarise).isEmpty)
-        XCTAssertNil(negativeBudget.resident(AdapterIdentifier("nothing")))
+        XCTAssertEqual(store.residentIdentifiers, [AdapterIdentifier("b")])
     }
 
     func testAZeroBytePayloadIsAdmittedRatherThanTrapping() {

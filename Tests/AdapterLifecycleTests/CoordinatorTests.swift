@@ -359,4 +359,52 @@ final class CoordinatorTests: XCTestCase {
         XCTAssertEqual(report.evalsInvalidated, [resident.id])
         XCTAssertFalse(report.evalsInvalidated.contains(neverInstalled.id))
     }
+
+    /// Regression: `forget` used to run only on the explicit `evict(_:)` path, so an
+    /// adapter dropped by LRU pressure inside `provision` left its kill switch, failure
+    /// count and eval behind — and a re-fetch silently inherited them. The README claims
+    /// "eviction forgets"; this is the path that made that claim false.
+    func testLRUEvictionDuringProvisionAlsoForgets() async {
+        let coordinator = makeCoordinator(budgetMegabytes: 100)
+        let doomed = Fixture.descriptor("doomed", revision: 1, megabytes: 60)
+        _ = await coordinator.provision(doomed)
+        await coordinator.recordEval(Fixture.passingEval(for: doomed))
+        await coordinator.revoke(doomed.id, reason: .killSwitch("INC-9"))
+        await coordinator.recordAdapterFailure(doomed.id)
+        await coordinator.recordComparison(adapter: doomed.id, task: Fixture.summarise, winner: .base)
+
+        // Nothing is pinned (no resolution has happened), so this evicts `doomed` for room.
+        let outcome = await coordinator.provision(Fixture.descriptor("newcomer", revision: 2, megabytes: 60))
+        XCTAssertEqual(outcome, .installed(evicted: [doomed.id]))
+
+        let afterEviction = await state(coordinator)
+        XCTAssertEqual(afterEviction.divergence.sampleCount, 0, "samples for an evicted adapter are meaningless")
+
+        // Re-fetch it: it must come back clean, not carrying the old operator state.
+        _ = await coordinator.provision(doomed)
+        let reborn = await state(coordinator)
+        let summary = reborn.residents.first { $0.descriptor.id == doomed.id }
+        XCTAssertNotNil(summary)
+        XCTAssertNil(summary?.revocation, "a re-fetched adapter must not inherit the old kill switch")
+        XCTAssertEqual(summary?.consecutiveFailures, 0)
+        XCTAssertEqual(summary?.evalVerdict, .missing)
+    }
+
+    /// A success clears the counter by removing the key, not by writing a zero — otherwise
+    /// every adapter that ever served leaves a permanent dictionary entry behind.
+    func testASuccessRemovesTheFailureEntryEntirely() async {
+        let coordinator = makeCoordinator()
+        let adapter = Fixture.descriptor("s")
+        _ = await coordinator.provision(adapter)
+        await coordinator.recordEval(Fixture.passingEval(for: adapter))
+        await coordinator.recordAdapterFailure(adapter.id)
+        let withFailure = await state(coordinator)
+        XCTAssertEqual(withFailure.residents.first?.consecutiveFailures, 1)
+
+        await coordinator.recordAdapterSuccess(adapter.id)
+        let cleared = await state(coordinator)
+        XCTAssertEqual(cleared.residents.first?.consecutiveFailures, 0)
+        let serving = await self.serving(coordinator)
+        XCTAssertTrue(serving.usesAdapter)
+    }
 }
