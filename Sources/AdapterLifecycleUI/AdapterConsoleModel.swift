@@ -1,0 +1,247 @@
+#if canImport(SwiftUI)
+import AdapterLifecycle
+import Observation
+
+/// Drives `AdapterConsoleView`.
+///
+/// Every control here maps onto exactly one coordinator call — there is no shadow state
+/// and no local copy of the policy. That is the point of the demo: the view can only show
+/// what the library actually decided, so a screenshot of it is evidence about the library
+/// rather than about the view.
+@MainActor
+@Observable
+public final class AdapterConsoleModel {
+
+    public struct LogLine: Identifiable, Sendable {
+        public let id: Int
+        public let text: String
+    }
+
+    public private(set) var snapshot: AdapterLifecycleCoordinator.LifecycleSnapshot?
+    public private(set) var outcome: ResolutionOutcome?
+    public private(set) var log: [LogLine] = []
+    public private(set) var selectedTask: TaskIdentifier
+    public private(set) var isBusy = false
+
+    private let configuration: AdapterConsoleConfiguration
+    private let coordinator: AdapterLifecycleCoordinator
+    private var osUpdateStep = 0
+    private var nextLogID = 0
+    private var pressureCandidateAdmitted = false
+
+    /// Newest first, capped. An unbounded activity log in a long-running demo is the same
+    /// bug as an unbounded telemetry buffer, just less consequential.
+    private static let logLimit = 40
+
+    public init(configuration: AdapterConsoleConfiguration) {
+        self.configuration = configuration
+        self.selectedTask = configuration.primaryTask
+        self.coordinator = AdapterLifecycleCoordinator(
+            configuration: AdapterLifecycleCoordinator.Configuration(
+                installationID: configuration.installationID,
+                evalGate: configuration.evalGate,
+                rollout: RolloutPolicy(exposurePercent: configuration.initialExposurePercent),
+                quarantineThreshold: configuration.quarantineThreshold,
+                storageBudgetBytes: configuration.storageBudgetBytes,
+                divergenceCapacity: 200
+            ),
+            installedBase: configuration.initialBaseModel
+        )
+    }
+
+    public var tasks: [TaskIdentifier] { configuration.tasks }
+
+    public var canSimulateOSUpdate: Bool { osUpdateStep < configuration.osUpdateLadder.count }
+
+    public var nextBaseModel: BaseModelVersion? {
+        guard configuration.osUpdateLadder.indices.contains(osUpdateStep) else { return nil }
+        return configuration.osUpdateLadder[osUpdateStep]
+    }
+
+    public var canFetchPressureCandidate: Bool {
+        configuration.pressureCandidate != nil && !pressureCandidateAdmitted
+    }
+
+    public var pressureCandidateLabel: String {
+        guard let candidate = configuration.pressureCandidate else { return "—" }
+        return "\(candidate.id.rawValue) · \(LifecyclePresentation.megabytes(candidate.payloadBytes))"
+    }
+
+    // MARK: - Lifecycle
+
+    /// Installs the catalog and records a fresh eval for each adapter against the base
+    /// model the device is currently on, so the console opens in a working state rather
+    /// than an empty one.
+    public func start() async {
+        guard snapshot == nil else { return }
+        await run {
+            for descriptor in self.configuration.catalog {
+                let outcome = await self.coordinator.provision(descriptor)
+                self.note(self.describe(outcome, for: descriptor))
+            }
+            await self.recordEvals(against: self.configuration.initialBaseModel)
+            self.note("Evaluated every adapter against base \(self.configuration.initialBaseModel)")
+        }
+    }
+
+    public func select(task: TaskIdentifier) async {
+        selectedTask = task
+        await run {}
+    }
+
+    // MARK: - Controls
+
+    /// The headline interaction. Moves the base model forward exactly as an OS update
+    /// would, and reports what that cost.
+    public func simulateOSUpdate() async {
+        guard let next = nextBaseModel else { return }
+        osUpdateStep += 1
+        await run {
+            let report = await self.coordinator.baseModelDidChange(to: next)
+            self.note("OS update: base model \(report.previous) → \(report.current)")
+            if report.evictedIncompatible.isEmpty {
+                self.note("No adapter was evicted — all remaining artifacts still fit their window")
+            } else {
+                self.note("Evicted as incompatible: \(report.evictedIncompatible.map(\.rawValue).joined(separator: ", "))")
+            }
+            if !report.evalsInvalidated.isEmpty {
+                self.note("Evals now stale: \(report.evalsInvalidated.map(\.rawValue).joined(separator: ", "))")
+            }
+            if report.divergenceSamplesDropped > 0 {
+                self.note("Dropped \(report.divergenceSamplesDropped) divergence samples taken against the old base")
+            }
+        }
+    }
+
+    /// Re-runs the offline eval against whatever base model is on the device now. This is
+    /// the recovery path after an OS update: the adapter is fine, the measurement was not.
+    public func reEvaluateAgainstCurrentBase() async {
+        await run {
+            let current = await self.coordinator.snapshot().installedBase
+            await self.recordEvals(against: current)
+            self.note("Re-evaluated every adapter against base \(current)")
+        }
+    }
+
+    public func setExposure(percent: Int) async {
+        await run {
+            await self.coordinator.setExposure(percent: percent)
+            self.note("Rollout exposure set to \(percent)%")
+        }
+    }
+
+    public func revokeServingAdapter() async {
+        guard let serving = outcome?.selection.adapterIdentifier else { return }
+        await run {
+            await self.coordinator.revoke(serving, reason: .killSwitch("INC-4471"))
+            self.note("Kill switch pulled on \(serving.rawValue)")
+        }
+    }
+
+    public func clearRevocations() async {
+        await run {
+            for descriptor in self.configuration.catalog {
+                await self.coordinator.clearRevocation(descriptor.id)
+            }
+            if let candidate = self.configuration.pressureCandidate {
+                await self.coordinator.clearRevocation(candidate.id)
+            }
+            self.note("Cleared every kill switch")
+        }
+    }
+
+    public func reportFailureOnServingAdapter() async {
+        guard let serving = outcome?.selection.adapterIdentifier else { return }
+        await run {
+            await self.coordinator.recordAdapterFailure(serving)
+            await self.coordinator.recordComparison(adapter: serving, task: self.selectedTask, winner: .base)
+            self.note("Recorded a failure for \(serving.rawValue)")
+        }
+    }
+
+    public func reportSuccessOnServingAdapter() async {
+        guard let serving = outcome?.selection.adapterIdentifier else { return }
+        await run {
+            await self.coordinator.recordAdapterSuccess(serving)
+            await self.coordinator.recordComparison(adapter: serving, task: self.selectedTask, winner: .adapter)
+            self.note("Recorded a success for \(serving.rawValue)")
+        }
+    }
+
+    /// Admits an artifact big enough to force eviction, so the storage policy is visible
+    /// rather than asserted.
+    public func fetchPressureCandidate() async {
+        guard let candidate = configuration.pressureCandidate else { return }
+        await run {
+            let outcome = await self.coordinator.provision(candidate)
+            self.note(self.describe(outcome, for: candidate))
+            if case .installed = outcome { self.pressureCandidateAdmitted = true }
+            let currentBase = await self.coordinator.snapshot().installedBase
+            await self.recordEvals(against: currentBase)
+        }
+    }
+
+    // MARK: - Private
+
+    private func run(_ body: @MainActor () async -> Void) async {
+        isBusy = true
+        await body()
+        outcome = await coordinator.selection(for: selectedTask)
+        snapshot = await coordinator.snapshot()
+        isBusy = false
+    }
+
+    private func recordEvals(against base: BaseModelVersion) async {
+        var everything = configuration.catalog
+        if let candidate = configuration.pressureCandidate { everything.append(candidate) }
+        for descriptor in everything {
+            guard let profile = configuration.evalProfiles[descriptor.id] else { continue }
+            await coordinator.recordEval(
+                EvalRecord(
+                    adapter: descriptor.id,
+                    adapterRevision: descriptor.revision,
+                    task: descriptor.task,
+                    evaluatedAgainstBase: base,
+                    adapterScore: profile.adapterScore,
+                    baseScore: profile.baseScore,
+                    sampleCount: profile.sampleCount
+                )
+            )
+        }
+    }
+
+    private func describe(
+        _ outcome: AdapterLifecycleCoordinator.ProvisionOutcome,
+        for descriptor: AdapterDescriptor
+    ) -> String {
+        let name = descriptor.id.rawValue
+        switch outcome {
+        case let .installed(evicted) where evicted.isEmpty:
+            return "Installed \(name) (\(LifecyclePresentation.megabytes(descriptor.payloadBytes)))"
+        case let .installed(evicted):
+            return "Installed \(name), evicting \(evicted.map(\.rawValue).joined(separator: ", "))"
+        case .alreadyResident:
+            return "\(name) was already resident"
+        case let .rejected(reason):
+            switch reason {
+            case let .rejectedExceedsBudget(payload, available):
+                return "Refused \(name): \(LifecyclePresentation.megabytes(payload)) will not fit in \(LifecyclePresentation.megabytes(available))"
+            case let .rejectedIncompatible(window, installed):
+                return "Refused \(name): built for \(window), device is on \(installed)"
+            case .admitted, .alreadyResident:
+                return "Installed \(name)"
+            }
+        case let .fetchFailed(detail):
+            return "Fetch failed for \(name): \(detail)"
+        case let .supersededByBaseModelChange(expected, observed):
+            return "Discarded \(name): base moved \(expected) → \(observed) mid-fetch"
+        }
+    }
+
+    private func note(_ text: String) {
+        nextLogID += 1
+        log.insert(LogLine(id: nextLogID, text: text), at: 0)
+        if log.count > Self.logLimit { log.removeLast(log.count - Self.logLimit) }
+    }
+}
+#endif
