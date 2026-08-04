@@ -188,7 +188,14 @@ public final class AdapterConsoleModel {
 
     // MARK: - Private
 
+    /// Serialises console actions.
+    ///
+    /// `isBusy` is checked and set without an intervening suspension point, and the whole
+    /// model is `@MainActor`, so this is a real guard rather than advisory: two overlapping
+    /// actions cannot interleave across the `await`s below and land their `snapshot`
+    /// assignments out of order.
     private func run(_ body: @MainActor () async -> Void) async {
+        guard !isBusy else { return }
         isBusy = true
         await body()
         outcome = await coordinator.selection(for: selectedTask)
@@ -202,9 +209,12 @@ public final class AdapterConsoleModel {
     /// that renders numbers someone typed into a struct and one where the gate is actually
     /// deciding on measured output.
     private func recordEvals(against base: BaseModelVersion) async {
-        var everything = configuration.catalog
-        if let candidate = configuration.pressureCandidate { everything.append(candidate) }
-        for descriptor in everything {
+        // Scoped to what is actually resident, not to the whole catalog. Filing an eval for
+        // an artifact the device just evicted would quietly re-create the record the
+        // coordinator deliberately forgot — in the app built to demonstrate that eviction
+        // forgets.
+        let residents = await coordinator.snapshot().residents.map(\.descriptor)
+        for descriptor in residents {
             guard let comparisons = configuration.evalFixtures[descriptor.id] else { continue }
             let record = evalRunner.evaluate(comparisons, adapter: descriptor, against: base)
             await coordinator.recordEval(record)
