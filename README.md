@@ -4,7 +4,9 @@
 
 That is the failure mode this package exists for, and it is worse than a crash because nothing reports it.
 
-iOS 27 adds on-device fine-tuning to the Foundation Models framework: you train LoRA adapter layers, ship a `.fmadapter`, and call `SystemLanguageModel(adapter:)`. Every guide stops there. But an adapter is trained against **one specific base model**, and on Apple platforms that base model ships with the OS and is replaced underneath you on Apple's schedule, not yours. The two-line integration is correct exactly until the first OS point release.
+The Foundation Models framework now supports LoRA adapters: you train the adapter layers **off-device** with Apple's toolkit, ship the resulting `.fmadapter` package with or alongside your app, and **serve it on-device** by constructing a session against it. Every guide stops there. But an adapter is trained against **one specific base model**, and on Apple platforms that base model ships with the OS and is replaced underneath you on Apple's schedule, not yours. The two-line integration is correct exactly until the first OS point release.
+
+*(Training is entitlement-gated behind `com.apple.developer.foundation-model-adapter` and a separate signed agreement with Apple. This repository contains no adapter artifacts and no entitlement — it is the decision layer that sits above them.)*
 
 `AdapterLifecycle` is the layer that turns "we shipped an adapter" into something operable: a versioned registry with compatibility gating, an offline eval gate that is itself version-bound, a storage budget with an eviction order, staged rollout, a kill switch, quarantine, and a hard fallback to the stock model — with a machine-readable reason attached to every fallback.
 
@@ -27,7 +29,7 @@ So the deliverable is not a feature. It is a **personalisation and compatibility
 The base model was the other half of every measurement you took. When the OS replaces it, your numbers describe a system that no longer exists on the device. `EvalGate` therefore refuses to honour an eval recorded against a different base version, and the adapter stands down until it has been measured again:
 
 ```
-base 27.0.0 → adapter serves,  delta +0.19 measured against 27.0.0
+base 27.0.0 → adapter serves,  measured lift +0.83 against 27.0.0
 OS updates  → base 27.1.0
             → adapter is STILL COMPATIBLE (window is open-ended)
             → but the eval is stale, so it falls back to the base model
@@ -51,6 +53,8 @@ A compatibility check alone sails straight past this. `CoordinatorTests.testACom
 | `ResolutionEngine` | The decision. Pure, synchronous, total. Returns a selection **and an audit trail of why every other candidate lost** |
 | `AdapterLifecycleCoordinator` | The actor that owns state and I/O, with an epoch guard against reentrancy across `await` |
 | `AdapterProvisioning` | The one-method seam to everything that touches bytes |
+| `TaskScorer`, `TokenOverlapF1Scorer` | The ROUGE-1 unigram-overlap F1 that turns two strings into a number. Swap in an embedding scorer by conforming your own type |
+| `OfflineEvalRunner` | Runs a golden set through the scorer and produces the `EvalRecord` — stamping it with the base model version by construction |
 | `AdapterLifecycleUI` | A SwiftUI console that renders the decision and its audit trail |
 
 The app never names a model. It asks `selection(for: task)` and gets back `.adapter(id, revision:)` or `.baseModel(reason:)`. That indirection is what makes rollout, rollback, quarantine and versioning possible without touching a single call site.
@@ -63,13 +67,22 @@ The app never names a model. It asks `selection(for: task)` and gets back `.adap
 The decision is a total function of its inputs and holds nothing; the actor holds everything and decides nothing. In production the question "was this a bad policy or a bad state transition?" then has one file per answer. *Rejected:* a single actor — easier to write, but the policy becomes untestable without constructing a whole coordinator. *Rejected:* making everything pure and pushing state to the app — moves the reentrancy and eviction bugs into every adopter's codebase.
 
 **Zero dependency on Foundation Models, and zero dependency on Foundation.**
-The entire package is stdlib-only, with `AdapterProvisioning` as the single seam to bytes on disk. *Cost:* the app writes a small shim that fetches an artifact and constructs a session. *Benefit:* the policy — the part with the interesting bugs — compiles, runs and is tested on Linux CI in under a second, on a machine that has never heard of Apple Intelligence. Every test in this repo runs in both places. *Rejected:* typing against `SystemLanguageModel` directly, which would have made the package unbuildable outside a simulator and untestable in CI.
+The policy core is stdlib-only, with `AdapterProvisioning` as the single seam to bytes on disk. (`AdapterLifecycleUI` imports SwiftUI, as a view layer must; its presentation logic is plain Swift and is tested on Linux with everything else.) *Cost:* the app writes a small shim that fetches an artifact and constructs a session. *Benefit:* the policy — the part with the interesting bugs — compiles, runs and is tested on Linux CI in under a second, on a machine that has never heard of Apple Intelligence. Every test in this repo runs in both places. *Rejected:* typing against `SystemLanguageModel` directly, which would have made the package unbuildable outside a simulator and untestable in CI.
 
 **FNV-1a for rollout bucketing, not `Hasher`.**
 `Hasher` is seeded per process, so the same install lands in a different bucket on every launch: users drift in and out of the cohort and a 5% rollout touches far more than 5% of installs over a week. *Rejected:* `Hasher` (unstable across launches). *Rejected:* SHA-256 via CryptoKit (drags in a dependency to solve a problem FNV already solves, and is not available on Linux).
 
 **Bucketing that does not depend on the exposure percentage.**
-Folding the percentage into the hash is the common shortcut and it is subtly broken: ramping the rollout re-shuffles every device, so installs that already saw the adapter lose it. `RolloutPolicyTests` asserts the monotonicity invariant directly, **and** feeds the broken version to the same invariant to prove the assertion can actually detect it.
+Folding the percentage into the hash is the common shortcut and it is subtly broken: ramping the rollout re-shuffles every device, so installs that already saw the adapter lose it. `RolloutPolicyTests` asserts the monotonicity invariant directly, **and** drives a deliberately threshold-sensitive `AdapterBucketing` through the real `RolloutPolicy.includes` to prove the assertion can actually detect it. That is what the `AdapterBucketing` seam is for: a mutation test that reimplements the broken logic inline proves the invariant has teeth while proving nothing about the code that ships.
+
+**Scores are computed, not supplied.**
+`EvalRecord` could have been "two `Double`s the caller invented", and a gate fed by unaudited magic constants is theatre. So the package ships a real metric — `TokenOverlapF1Scorer`, unigram-overlap F1 over token bags — and an `OfflineEvalRunner` that turns a golden set into a record, stamping it with the base model version by construction rather than leaving that to whoever wrote the calling code. *Rejected:* embedding cosine similarity, which is the better metric and what a production pipeline should use — but it needs a model on the device, which would undo the entire `AdapterProvisioning` split. Conform your own type to `TaskScorer` and nothing else changes. *Rejected:* plain ROUGE-1 recall, which rewards a model for padding its answer with every plausible word; F1 penalises exactly the verbosity drift that fine-tuning tends to produce.
+
+**The pin set is a set.**
+`selection(for:)` pins the union of the adapters serving *all* tasks, not just the one being resolved. An earlier version pinned a single identifier, which meant a two-task app exposed task A's live adapter to eviction the moment anything asked about task B. `CoordinatorTests.testResolvingASecondTaskDoesNotUnpinTheFirstTasksAdapter` is that regression.
+
+**Eviction forgets.**
+Dropping an artifact also drops its eval, its revocation, its failure count and its divergence samples. *Rejected:* keeping them "in case it comes back" — that turns four dictionaries keyed by a server-controlled identifier space into an unbounded leak in a process expected to run for weeks, and lets a re-fetched adapter silently inherit a kill switch someone cleared months ago.
 
 **An epoch counter for reentrancy, not a re-check of the compatibility predicate.**
 `provision` checks compatibility, then `await`s a fetch — and an actor is reentrant across that suspension point. *Rejected:* re-running `compatibility.contains(installedBase)` after the await. It looks equivalent and is not: if the new base model is still inside the adapter's window, the re-check passes while the eval that authorised the adapter has gone stale. The epoch catches the state change itself rather than one predicate over it. `CoordinatorConcurrencyTests` drives exactly that interleaving with a fetch held open, plus a control case proving the test is not just observing that gated fetches never succeed.
@@ -109,7 +122,7 @@ let coordinator = AdapterLifecycleCoordinator(
     provisioner: MyDownloader()                   // your bytes, your signature checks
 )
 
-switch await coordinator.selection(for: .summarise).selection {
+switch await coordinator.selection(for: TaskIdentifier("summarise")).selection {
 case let .adapter(id, _):
     // construct a session with this adapter
 case let .baseModel(reason):
@@ -137,13 +150,52 @@ Foundation Models on-device fine-tuning is entitlement-gated (`com.apple.develop
 
 ## Verification
 
-<!-- VERIFICATION -->
+Stated precisely, because "it builds" and "it runs" are different claims and conflating
+them is the most common way a portfolio repo overstates itself.
+
+**What was verified.** `swift build -Xswiftc -warnings-as-errors` and
+`swift test -Xswiftc -warnings-as-errors` both pass. **129 tests, 0 failures, 0 warnings**,
+from a clean tree (`.build` removed first — an incremental `swift build` compiles nothing
+and still prints `Build complete!`, so it is evidence of nothing).
+
+Both jobs on the [Actions tab](https://github.com/rajatslakhina/fm-adapter-lifecycle-kit/actions)
+run exactly those two commands, so the zero-warning claim is machine-enforced rather than
+asserted here:
+
+| Job | What it proves |
+|---|---|
+| **Linux · Swift 6** (`swift:6.0` container) | The policy core has no Apple dependency at all. If anything in `AdapterLifecycle` ever reaches for Foundation Models, this job goes red. |
+| **macOS · Swift 6** (`macos-15`) | SwiftUI exists here, so this is the run that actually compiles the `AdapterLifecycleUI` console — and it additionally builds for `generic/platform=iOS Simulator`, so the `.iOS(.v17)` line in `Package.swift` is a checked claim rather than an assertion. |
+
+Test distribution: `AdapterStorageTests` 17 · `CoordinatorTests` 16 ·
+`ResolutionEngineTests` 15 · `EvalGateTests` 14 · `PresentationTests` 12 ·
+`RolloutPolicyTests` 12 · `DivergenceLedgerTests` 9 · `NumericsTests` 8 ·
+`TokenOverlapF1ScorerTests` 8 · `VersioningTests` 8 · `OfflineEvalRunnerTests` 5 ·
+`CoordinatorConcurrencyTests` 5.
+
+**What was *not* verified.** The companion demo app was **not** run on a Simulator, and
+**no screenshots of it exist**. Computer-use access to Xcode and Simulator was requested
+three times during this build and refused each time with:
+`Computer-use access to "Simulator" can't be approved during a scheduled run.`
+The demo repo's CI *is* green: it resolves this package from GitHub at a released version,
+prints the resulting `Package.resolved`, and compiles the app for
+`generic/platform=iOS Simulator`. That proves the project builds and the dependency really
+resolves over the network. It does **not** prove the app launches, and nothing here should
+be read as claiming otherwise.
 
 ---
 
 ## Demo app
 
-<!-- DEMO_LINK -->
+[**fm-adapter-lifecycle-demo-app**](https://github.com/rajatslakhina/fm-adapter-lifecycle-demo-app)
+— a SwiftUI console that consumes this package as a **remote** Swift Package at a released
+version, exactly the way any other adopter would.
+
+Ship an OS update in it and watch a perfectly healthy adapter stand down with the reason
+attached; ramp the rollout; pull the kill switch; fill the storage budget and watch the
+eviction order run. Two repositories on purpose: this one has no app target of any kind, and
+the demo has no copy of the library. If the package reference were a local path, the demo
+would prove nothing about whether this library is usable by anyone else.
 
 ---
 
